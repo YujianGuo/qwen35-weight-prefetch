@@ -1,0 +1,7 @@
+* text=auto
+*.patch text eol=lf whitespace=-blank-at-eol
+*.sh text eol=lf
+*.py text eol=lf
+*.asc text eol=lf
+*.txt text eol=lf
+*.md text eol=lf

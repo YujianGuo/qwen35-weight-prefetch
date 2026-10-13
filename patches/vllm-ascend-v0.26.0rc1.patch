@@ -1,0 +1,277 @@
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -61,6 +61,17 @@ class AscendConfig:
+     def __init__(self, vllm_config: "VllmConfig"):
+         self.vllm_config = vllm_config
+         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
++        from vllm_ascend.ops.weight_prefetch_config import Qwen35WeightPrefetchConfig
++
++        self.qwen35_weight_prefetch = Qwen35WeightPrefetchConfig.parse(
++            additional_config.get("qwen35_weight_prefetch", {})
++        )
++        if self.qwen35_weight_prefetch.enabled and (
++            vllm_config.model_config.enable_sleep_mode or vllm_config.weight_transfer_config is not None
++        ):
++            raise ValueError(
++                "Qwen3.5 weight prefetch requires static weights; sleep and weight transfer are unsupported"
++            )
+         self._check_mooncake_c8_kv_cache_quant(vllm_config)
+ 
+         xlite_graph_config = additional_config.get("xlite_graph_config", {})
+diff --git a/vllm_ascend/ascend_forward_context.py b/vllm_ascend/ascend_forward_context.py
+--- a/vllm_ascend/ascend_forward_context.py
++++ b/vllm_ascend/ascend_forward_context.py
+@@ -61,6 +61,27 @@ def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
+     return bool(getattr(scheduler_config, "recompute_scheduler_enable", False))
+ 
++def decode_concurrency():
++    """Min decode-request count across kv groups when the batch is pure decode, else 0."""
++    try:
++        context = get_forward_context()
++    except AssertionError:
++        return 0
++    if getattr(context, "is_draft_model", False):
++        return 0
++    metadata = context.attn_metadata
++    if not isinstance(metadata, dict) or not metadata:
++        return 0
++    found = False
++    concurrency = None
++    for value in metadata.values():
++        if not hasattr(value, "num_prefills") or not hasattr(value, "num_decodes"):
++            continue
++        found = True
++        if value.num_prefills != 0 or value.num_decodes <= 0:
++            return 0
++        concurrency = value.num_decodes if concurrency is None else min(concurrency, value.num_decodes)
++    return concurrency if found else 0
+ 
+ @contextmanager
+ def override_mrv2_in_profile_run(enabled: bool):
+     """Override MRv2's extra profile-run marker for one forward path.
+diff --git a/vllm_ascend/ops/fused_moe/fused_moe.py b/vllm_ascend/ops/fused_moe/fused_moe.py
+--- a/vllm_ascend/ops/fused_moe/fused_moe.py
++++ b/vllm_ascend/ops/fused_moe/fused_moe.py
+@@ -677,7 +677,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+         trunc_size: int,
+     ) -> torch.Tensor:
+         if not self._allgather_requires_early_routed_reduce:
+-            states = torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(states)
++            prefetch_layer_name = getattr(self, "_qwen35_prefetch_layer_name", "")
++            if prefetch_layer_name:
++                states = torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(states, prefetch_layer_name)
++            else:
++                states = torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(states)
+         return states[..., :trunc_size]
+ 
+     def apply_routed_output_transform(
+diff --git a/vllm_ascend/ops/fused_moe/moe_mlp.py b/vllm_ascend/ops/fused_moe/moe_mlp.py
+--- a/vllm_ascend/ops/fused_moe/moe_mlp.py
++++ b/vllm_ascend/ops/fused_moe/moe_mlp.py
+@@ -690,5 +690,11 @@ def unquant_apply_mlp(
+         w2 = _maybe_transpose_moe_weights(w2)
+ 
++    from vllm_ascend.ops.weight_prefetch_qwen35 import current_controller
++
++    prefetch = current_controller() if lora_context is None else None
++    prefetch_started = prefetch is not None and prefetch.begin_routed(
++        w2, group_list, hidden_states, "after_dispatch", group_list_type
++    )
+     gate_up_out = torch_npu.npu_grouped_matmul(
+         x=[hidden_states],
+         weight=_as_grouped_matmul_weights(w1),
+@@ -700,5 +706,8 @@ def unquant_apply_mlp(
+         group_list=group_list,
+     )[0]
+ 
++    if prefetch is not None and not prefetch_started:
++        prefetch_started = prefetch.begin_routed(w2, group_list, gate_up_out, "after_gmm1", group_list_type)
++
+     # MoE LoRA: only attempt injection when an adapter wraps this layer and
+     # the comm method provided routing metadata in lora_context.
+@@ -771,6 +780,9 @@ def unquant_apply_mlp(
+     if topk_scales is not None:
+         gate_up_out *= topk_scales
+ 
++    if prefetch_started:
++        prefetch.join()
++
+     hidden_states = torch_npu.npu_grouped_matmul(
+         x=[gate_up_out],
+         weight=_as_grouped_matmul_weights(w2),
+diff --git a/vllm_ascend/ops/gdn.py b/vllm_ascend/ops/gdn.py
+--- a/vllm_ascend/ops/gdn.py
++++ b/vllm_ascend/ops/gdn.py
+@@ -75,6 +75,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+         2. Core attention (custom op)
+         3. Output projection
+         """
++        # Deferred next_input prefetch: join the side stream before this layer's
++        # input projections read the prefetched weight. Identity return keeps the
++        # op alive without declaring a mutation of the residual stream.
++        next_input_join_key = getattr(self, "_qwen35_next_input_prefetch_join_key", "")
++        if next_input_join_key:
++            hidden_states = torch.ops.vllm.qwen35_next_input_prefetch_join(hidden_states, next_input_join_key)
++
+         num_tokens = hidden_states.size(0)
+         if hasattr(self, "in_proj_qkv"):
+             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+@@ -111,6 +118,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+                     self.head_v_dim,
+                 )
+ 
++        # Bind-time identity keeps this path inert unless the main-model GDN
++        # out_proj target was validated before graph capture.
++        prefetch_layer_name = getattr(self, "_qwen35_gdn_out_prefetch_layer_name", "")
++        if prefetch_layer_name:
++            torch.ops.vllm.qwen35_gdn_out_prefetch_commit(a, prefetch_layer_name)
++
+         # ============================================================
+         # Part 2: Core Attention (Custom Op)
+         # ============================================================
+@@ -139,6 +152,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+         z = z.reshape(-1, z.shape[-1])
+         core_attn_out = self.norm(core_attn_out, z)
++        if prefetch_layer_name:
++            torch.ops.vllm.qwen35_gdn_out_prefetch_join(core_attn_out, prefetch_layer_name)
+         core_attn_out = core_attn_out.reshape(z_shape_og)
+         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+         out, _ = self.out_proj(core_attn_out)
+diff --git a/vllm_ascend/ops/register_custom_ops.py b/vllm_ascend/ops/register_custom_ops.py
+--- a/vllm_ascend/ops/register_custom_ops.py
++++ b/vllm_ascend/ops/register_custom_ops.py
+@@ -137,7 +137,24 @@ def _pad_and_reduce_fake(x: torch.Tensor) -> torch.Tensor:
+     )
+ 
+ 
+-def _maybe_all_reduce_tensor_model_parallel_impl(final_hidden_states: torch.Tensor) -> torch.Tensor:
++def _maybe_all_reduce_tensor_model_parallel_impl(
++    final_hidden_states: torch.Tensor, prefetch_layer_name: str = ""
++) -> torch.Tensor:
++    if prefetch_layer_name:
++        from vllm_ascend.ops.weight_prefetch_qwen35 import current_controller
++
++        controller = current_controller()
++        next_input_started = controller is not None and controller.begin_next(prefetch_layer_name, final_hidden_states)
++        prepared_gdn_out = (
++            controller.prepare_next_gdn_out(prefetch_layer_name, final_hidden_states) if controller is not None else None
++        )
++        if next_input_started or prepared_gdn_out is not None:
++            result = _maybe_all_reduce_tensor_model_parallel_impl(final_hidden_states)
++            if prepared_gdn_out is not None:
++                controller.commit_next_gdn_out(prepared_gdn_out)
++            if next_input_started:
++                controller.settle_next_input()
++            return result
+     moe_comm_type = _EXTRA_CTX.moe_comm_type
+     if (
+         moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
+@@ -148,6 +165,39 @@ def _maybe_all_reduce_tensor_model_parallel_impl(final_hidden_states: torch.Tensor) -> torch.Tensor:
+         return tensor_model_parallel_all_reduce(final_hidden_states)
+ 
+ 
++def _qwen35_gdn_out_prefetch_commit_impl(dependency: torch.Tensor, layer_name: str) -> None:
++    from vllm_ascend.ops.weight_prefetch_qwen35 import current_controller
++
++    controller = current_controller()
++    if controller is not None:
++        controller.begin_gdn_out(layer_name, dependency)
++
++
++def _qwen35_gdn_out_prefetch_join_impl(consumer_input: torch.Tensor, layer_name: str) -> None:
++    from vllm_ascend.ops.weight_prefetch_qwen35 import current_controller
++
++    controller = current_controller()
++    if controller is not None:
++        controller.join_gdn_out(layer_name)
++
++
++def _qwen35_gdn_out_prefetch_fake(_dependency: torch.Tensor, _layer_name: str) -> None:
++    return
++
++
++def _qwen35_next_input_prefetch_join_impl(consumer_input: torch.Tensor, layer_name: str) -> torch.Tensor:
++    from vllm_ascend.ops.weight_prefetch_qwen35 import current_controller
++
++    controller = current_controller()
++    if controller is not None:
++        controller.join_next_input(layer_name)
++    return consumer_input
++
++
++def _qwen35_next_input_prefetch_join_fake(consumer_input: torch.Tensor, _layer_name: str) -> torch.Tensor:
++    return consumer_input
++
++
+ def _matmul_and_reduce_impl(input_parallel: torch.Tensor, layer_name: str) -> torch.Tensor:
+     forward_context = get_forward_context()
+     self = forward_context.no_compile_layers[layer_name]
+@@ -245,5 +295,5 @@ direct_register_custom_op(
+     op_name="maybe_all_reduce_tensor_model_parallel",
+     op_func=_maybe_all_reduce_tensor_model_parallel_impl,
+-    fake_impl=lambda x: x,
++    fake_impl=lambda x, prefetch_layer_name="": x,
+     mutates_args=[],
+     dispatch_key="PrivateUse1",
+@@ -250,6 +300,30 @@ direct_register_custom_op(
+ )
+ 
++direct_register_custom_op(
++    op_name="qwen35_gdn_out_prefetch_commit",
++    op_func=_qwen35_gdn_out_prefetch_commit_impl,
++    fake_impl=_qwen35_gdn_out_prefetch_fake,
++    mutates_args=["dependency"],
++    dispatch_key="PrivateUse1",
++)
++
++direct_register_custom_op(
++    op_name="qwen35_gdn_out_prefetch_join",
++    op_func=_qwen35_gdn_out_prefetch_join_impl,
++    fake_impl=_qwen35_gdn_out_prefetch_fake,
++    mutates_args=["consumer_input"],
++    dispatch_key="PrivateUse1",
++)
++
++direct_register_custom_op(
++    op_name="qwen35_next_input_prefetch_join",
++    op_func=_qwen35_next_input_prefetch_join_impl,
++    fake_impl=_qwen35_next_input_prefetch_join_fake,
++    mutates_args=[],
++    dispatch_key="PrivateUse1",
++)
++
+ direct_register_custom_op(
+     op_name="matmul_and_reduce",
+     op_func=_matmul_and_reduce_impl,
+     fake_impl=_matmul_and_reduce_impl_fake,
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -3609,6 +3609,13 @@ class NPUModelRunner(GPUModelRunner):
+             # collect eplb heat for all requests.
+             self.eplb_heat_collection_status =  True
+ 
++    def reload_weights(self, *args, **kwargs) -> None:
++        if self.ascend_config.qwen35_weight_prefetch.enabled:
++            raise RuntimeError(
++                "Qwen3.5 weight prefetch captures weight addresses. Restart with prefetch disabled before reloading."
++            )
++        return super().reload_weights(*args, **kwargs)
++
+     def load_model(self) -> None:
+         load_model_start_time = time.perf_counter()
+         logger.info("Starting to load model %s...", self.model_config.model)
+@@ -3711,6 +3718,11 @@ class NPUModelRunner(GPUModelRunner):
+ 
+         get_offloader().post_init()
+ 
++        if self.ascend_config.qwen35_weight_prefetch.enabled:
++            from vllm_ascend.ops.weight_prefetch_qwen35 import bind_qwen35_weight_prefetch
++
++            bind_qwen35_weight_prefetch(self.model, self.vllm_config, self.ascend_config.qwen35_weight_prefetch)
++
+         mm_config = self.model_config.multimodal_config
+         self.is_multimodal_pruning_enabled = (
+             supports_multimodal_pruning(self.get_model())
