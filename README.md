@@ -79,7 +79,36 @@ An isolated experiment can select targets and budgets, for example:
 
 This repository is a code package, not a performance acceptance report. Measure latency, tail latency, output consistency, and device-side consumer waits on the intended workload before enabling the feature for service traffic.
 
+## RealWorldQA performance snapshot
+
+The following descriptive comparison is transcribed from the supplied RealWorldQA summary CSVs: `base/base_realworldqa.csv` and `weight_gate8_2atten/realworldqa.csv`. Both report 765 requests. The `weight_gate8_2atten` string is kept as the input directory label; its exact runtime configuration is not specified by these CSVs.
+
+For latency rows, a negative change means lower latency; for throughput rows, a positive change means higher throughput.
+
+| Metric | Base | `weight_gate8_2atten` | Change |
+|---|---:|---:|---:|
+| E2EL mean | 18,513.3 ms | 17,728.6 ms | -4.24% |
+| E2EL median | 14,981.4 ms | 13,737.9 ms | -8.30% |
+| E2EL P90 | 33,340.5 ms | 35,176.1 ms | +5.51% (slower) |
+| E2EL P99 | 60,003.9 ms | 56,650.2 ms | -5.59% |
+| TTFT mean | 1,822.0 ms | 1,645.2 ms | -9.70% |
+| TTFT median | 1,548.6 ms | 1,444.5 ms | -6.72% |
+| TTFT P99 | 8,115.3 ms | 6,894.2 ms | -15.05% |
+| TPOT mean | 103.9 ms | 98.2 ms | -5.49% |
+| TPOT median | 104.7 ms | 99.0 ms | -5.44% |
+| TPOT P90 | 124.6 ms | 115.1 ms | -7.62% |
+| TPOT P99 | 140.8 ms | 133.3 ms | -5.33% |
+| Output-token throughput mean | 8.7554 token/s | 9.2938 token/s | +6.15% |
+| Prefill-token throughput mean | 966.4794 token/s | 1,060.1459 token/s | +9.69% |
+
+Both CSVs report the same input-token summary (mean 1,448.4562; median 1,443; P75 1,464; P90 1,901; P99 1,927.8). Their output-token summaries differ slightly (mean 162.5516 vs. 164.9333; median 128 vs. 126).
+
+These are aggregate summaries, not a controlled A/B acceptance result: the files do not include per-request pairing, alternating-session order or drift, output hashes/accuracy, model and service revisions, the exact variant configuration, or P95. In particular, E2EL P90 regresses even though its median and P99 improve. The CSVs therefore support reporting the observed deltas only; they do not establish output equivalence or isolate prefetch as the cause.
+
 ## Provenance
 
 Source was collected from `qwen35_weight1005` at the base commit and environment recorded in [`TARGET.md`](TARGET.md). The overlay targets vLLM-Ascend and follows its Apache-2.0 licensing; see [`LICENSE`](LICENSE).
 
+## Co-authors
+
+- westbook16 <1210973614@qq.com>
